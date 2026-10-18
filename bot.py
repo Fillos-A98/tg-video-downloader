@@ -11,7 +11,7 @@ import yt_dlp
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -23,6 +23,8 @@ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("tg-video-downloader")
 
 
@@ -96,26 +98,46 @@ def download_video(url: str, folder: str) -> tuple[Path, str]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
-        return await update.message.reply_text("Немає доступу до цього бота.")
+        return await update.message.reply_text("You are not authorized to use this bot.")
     await update.message.reply_text(
-        "Надішли посилання на відео з YouTube, TikTok або іншого сайту, який підтримує yt-dlp.\n\n"
-        "Завантажую найкращу доступну якість. Приватні відео та контент за авторизацією можуть не працювати."
+        "Send a video link from YouTube, TikTok, or any other site supported by yt-dlp.\n\n"
+        "I download the best available quality. Private videos and content requiring authentication may not work."
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if authorized(update):
-        await update.message.reply_text("Просто надішли URL відео. Команда /id показує твій Telegram user ID.")
+        await update.message.reply_text("Just send a video URL. Use /id to view your Telegram user ID.")
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user:
-        await update.message.reply_text(f"Твій Telegram user ID: {update.effective_user.id}")
+        await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
+
+
+async def on_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    change = update.my_chat_member
+    if not change:
+        return
+
+    old_status = change.old_chat_member.status
+    new_status = change.new_chat_member.status
+
+    if old_status in {"left", "kicked"} and new_status in {"member", "administrator"}:
+        await context.bot.send_message(
+            chat_id=change.chat.id,
+            text=(
+                "Hey! Reply to a message containing a video link and mention "
+                "@elfilosxyzbot, and I’ll send the file here.\n\n"
+                "SoundCloud is supported too — audio is converted to MP3.\n"
+                "/help — for instructions."
+            ),
+        )
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message:
+    if not message or not (message.text or message.caption):
         return
 
     # In groups, only react to an explicit @bot mention in a reply to a link.
@@ -127,25 +149,21 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if (
             not message.reply_to_message
             or not bot_username
-            or not re.search(
-                rf"(?<![\\w])@{re.escape(bot_username)}\\b",
-                command_text,
-                re.IGNORECASE,
-            )
+            or f"@{bot_username}".casefold() not in command_text.casefold()
         ):
             return
         url_message = message.reply_to_message
 
     if not authorized(update):
-        await message.reply_text("Немає доступу до цього бота.")
+        await message.reply_text("You are not authorized to use this bot.")
         return
 
     url = extract_url(url_message.text or url_message.caption or "")
     if not url:
-        await message.reply_text("У повідомленні, на яке ти відповів, не знайшов коректного HTTP(S)-посилання.")
+        await message.reply_text("I couldn’t find a valid HTTP(S) link in the message you replied to.")
         return
 
-    status = await message.reply_text("Отримав посилання. Завантажую відео в найкращій доступній якості…")
+    status = await message.reply_text("Link received. Downloading the best available quality…")
     workdir = tempfile.mkdtemp(prefix="tgdl-", dir=DOWNLOAD_DIR)
     try:
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
@@ -153,10 +171,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             file_path, title = await asyncio.to_thread(download_video, url, workdir)
         except Exception as exc:
             log.warning("Download failed: %s", exc, exc_info=True)
-            await status.edit_text("Не вдалося завантажити це відео. Можливо, сайт змінив захист або посилання недоступне.")
+            await status.edit_text("Could not download this video. The site may have changed its protections, or the link may be unavailable.")
             return
 
-        await status.edit_text(f"Завантажено: {title}\nНадсилаю файл…")
+        await status.edit_text(f"Downloaded: {title}\nSending file…")
         if is_soundcloud_url(url):
             with file_path.open("rb") as audio:
                 await message.reply_audio(
@@ -187,7 +205,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
                 video_width = int(dimensions.get("width", 0))
                 video_height = int(dimensions.get("height", 0))
-                logging.info("Video dimensions for %s:\\n%s", file_path.name, probe_out.decode().strip())
+                logging.info("Video dimensions for %s:\n%s", file_path.name, probe_out.decode().strip())
                 if probe.returncode:
                     logging.warning("ffprobe failed: %s", probe_err.decode().strip())
 
@@ -206,7 +224,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as exc:
         log.exception("Processing failed: %s", exc)
         try:
-            await status.edit_text("Не вдалося надіслати файл через Telegram API.")
+            await status.edit_text("Could not send the file through the Telegram API.")
         except Exception:
             pass
     finally:
@@ -224,11 +242,11 @@ def main() -> None:
     .local_mode(True)
     .build()
 )
+    app.add_handler(ChatMemberHandler(on_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(MessageHandler(filters.CaptionRegex(URL_RE.pattern), handle_url))
+    app.add_handler(MessageHandler(filters.ALL, handle_url))
     log.info("Bot is starting")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

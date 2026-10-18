@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: video-sound-downloader
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      DOWNLOAD_DIR: /app/downloads
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    init: true

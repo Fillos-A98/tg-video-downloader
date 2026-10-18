@@ -1,0 +1,9 @@
+.git
+.env
+.venv
+venv
+__pycache__
+*.py[cod]
+*.bak
+bot.py.bak*
+downloads
