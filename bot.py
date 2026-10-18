@@ -115,13 +115,34 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not authorized(update):
-        if message:
-            await message.reply_text("Немає доступу до цього бота.")
+    if not message:
         return
-    url = extract_url(message.text or message.caption or "")
+
+    # In groups, only react to an explicit @bot mention in a reply to a link.
+    # In private chats, keep the simple "send a URL" workflow.
+    url_message = message
+    if message.chat.type in {"group", "supergroup"}:
+        command_text = message.text or message.caption or ""
+        bot_username = context.bot.username
+        if (
+            not message.reply_to_message
+            or not bot_username
+            or not re.search(
+                rf"(?<![\\w])@{re.escape(bot_username)}\\b",
+                command_text,
+                re.IGNORECASE,
+            )
+        ):
+            return
+        url_message = message.reply_to_message
+
+    if not authorized(update):
+        await message.reply_text("Немає доступу до цього бота.")
+        return
+
+    url = extract_url(url_message.text or url_message.caption or "")
     if not url:
-        await message.reply_text("Не знайшов коректного HTTP(S)-посилання.")
+        await message.reply_text("У повідомленні, на яке ти відповів, не знайшов коректного HTTP(S)-посилання.")
         return
 
     status = await message.reply_text("Отримав посилання. Завантажую відео в найкращій доступній якості…")
