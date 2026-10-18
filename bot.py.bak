@@ -1,0 +1,184 @@
+import asyncio
+import logging
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+import yt_dlp
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ALLOWED_USERS = {
+    int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("tg-video-downloader")
+
+
+def authorized(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and (not ALLOWED_USERS or user.id in ALLOWED_USERS))
+
+
+def extract_url(text: str) -> str | None:
+    match = URL_RE.search(text or "")
+    if not match:
+        return None
+    url = match.group(0).rstrip(".,!?)]}>")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    # Reject localhost and private/local hostnames; this bot is intended for public video URLs.
+    host = parsed.hostname.lower()
+    if host in {"localhost", "localhost.localdomain"} or ".local" in host:
+        return None
+    return url
+
+
+def download_video(url: str, folder: str) -> tuple[Path, str]:
+    opts = {
+        "format": "bestvideo*+bestaudio/best",
+        "outtmpl": str(Path(folder) / "%(title).150B [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+        "restrictfilenames": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 20,
+        "max_filesize": 2 * 1024 * 1024 * 1024,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = Path(ydl.prepare_filename(info))
+        # yt-dlp may merge streams into mp4, changing the extension.
+        if not filename.exists():
+            candidates = list(Path(folder).glob(f"*{info.get('id', '')}*"))
+            candidates = [p for p in candidates if p.is_file()]
+            if not candidates:
+                raise FileNotFoundError("yt-dlp completed but the output file was not found")
+            filename = max(candidates, key=lambda p: p.stat().st_size)
+        title = str(info.get("title") or filename.name)
+        return filename, title
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return await update.message.reply_text("Немає доступу до цього бота.")
+    await update.message.reply_text(
+        "Надішли посилання на відео з YouTube, TikTok або іншого сайту, який підтримує yt-dlp.\n\n"
+        "Завантажую найкращу доступну якість. Приватні відео та контент за авторизацією можуть не працювати."
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if authorized(update):
+        await update.message.reply_text("Просто надішли URL відео. Команда /id показує твій Telegram user ID.")
+
+
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user:
+        await update.message.reply_text(f"Твій Telegram user ID: {update.effective_user.id}")
+
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not authorized(update):
+        if message:
+            await message.reply_text("Немає доступу до цього бота.")
+        return
+    url = extract_url(message.text or message.caption or "")
+    if not url:
+        await message.reply_text("Не знайшов коректного HTTP(S)-посилання.")
+        return
+
+    status = await message.reply_text("Отримав посилання. Завантажую відео в найкращій доступній якості…")
+    workdir = tempfile.mkdtemp(prefix="tgdl-", dir=DOWNLOAD_DIR)
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        try:
+            file_path, title = await asyncio.to_thread(download_video, url, workdir)
+        except Exception as exc:
+            log.warning("Download failed: %s", exc, exc_info=True)
+            await status.edit_text("Не вдалося завантажити це відео. Можливо, сайт змінив захист або посилання недоступне.")
+            return
+
+        await status.edit_text(f"Завантажено: {title}\nНадсилаю файл…")
+        with file_path.open("rb") as video:
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,sample_aspect_ratio,display_aspect_ratio",
+                "-of", "default=noprint_wrappers=1",
+                str(file_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            probe_out, probe_err = await probe.communicate()
+            dimensions = dict(
+                line.split("=", 1)
+                for line in probe_out.decode().splitlines()
+                if "=" in line
+            )
+            video_width = int(dimensions.get("width", 0))
+            video_height = int(dimensions.get("height", 0))
+            logging.info("Video dimensions for %s:\\n%s", file_path.name, probe_out.decode().strip())
+            if probe.returncode:
+                logging.warning("ffprobe failed: %s", probe_err.decode().strip())
+
+            await message.reply_video(
+                width=video_width or None,
+                height=video_height or None,
+                video=video,
+                caption=title[:900],
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+        await status.delete()
+    except Exception as exc:
+        log.exception("Processing failed: %s", exc)
+        try:
+            await status.edit_text("Не вдалося надіслати файл через Telegram API.")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def main() -> None:
+    if not TOKEN:
+        raise SystemExit("BOT_TOKEN is missing. Copy .env.example to .env and set the token.")
+    app = (
+    Application.builder()
+    .token(TOKEN)
+    .base_url("http://127.0.0.1:8081/bot")
+    .base_file_url("http://127.0.0.1:8081/file/bot")
+    .local_mode(True)
+    .build()
+)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(MessageHandler(filters.CaptionRegex(URL_RE.pattern), handle_url))
+    log.info("Bot is starting")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
