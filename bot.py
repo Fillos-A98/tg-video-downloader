@@ -50,7 +50,12 @@ def extract_url(text: str) -> str | None:
 
 def is_soundcloud_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
-    return host == "soundcloud.com" or host.endswith(".soundcloud.com") or host == "snd.sc"
+    return (
+        host == "soundcloud.com"
+        or host.endswith(".soundcloud.com")
+        or host == "snd.sc"
+        or host == "music.youtube.com"
+    )
 
 
 def download_video(url: str, folder: str) -> tuple[Path, str]:
