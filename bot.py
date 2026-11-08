@@ -28,7 +28,7 @@ MAX_VIDEO_BYTES = 2_000_000_000  # 2 GB
 MAX_LINKS_PER_MESSAGE = 5
 RATE_LIMIT_REQUESTS = 3
 RATE_LIMIT_WINDOW = 30
-URL_RE = re.compile(r"https?://[^\\s]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # In-memory anti-spam state. A restart clears the short-lived counters.
 request_timestamps: dict[int, deque[float]] = defaultdict(deque)
