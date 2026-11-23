@@ -7,7 +7,9 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from urllib.request import Request, urlopen
+from html.parser import HTMLParser
 
 import yt_dlp
 from dotenv import load_dotenv
@@ -60,6 +62,84 @@ def extract_urls(text: str) -> list[str]:
             urls.append(url)
             seen.add(url)
     return urls
+
+
+def is_pinterest_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "pinterest.com" or host.endswith(".pinterest.com") or host == "pin.it"
+
+
+class PinterestMetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.meta = {}
+        self.title = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "meta":
+            return
+        data = dict(attrs)
+        key = (data.get("property") or data.get("name") or "").lower()
+        value = data.get("content")
+        if key and value:
+            self.meta[key] = value
+
+
+def download_pinterest_image(url: str, folder: str) -> tuple[Path, str]:
+    request = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    with urlopen(request, timeout=25) as response:
+        page_url = response.geturl()
+        html = response.read(5_000_000).decode("utf-8", errors="replace")
+
+    parser = PinterestMetaParser()
+    parser.feed(html)
+    image_url = (
+        parser.meta.get("og:image")
+        or parser.meta.get("twitter:image")
+        or parser.meta.get("og:image:secure_url")
+    )
+    title = parser.meta.get("og:title") or "Pinterest image"
+    if not image_url:
+        raise ValueError("Pinterest page did not expose a public image URL")
+
+    image_url = urljoin(page_url, image_url)
+    image_request = Request(image_url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+        "Referer": "https://www.pinterest.com/",
+    })
+    with urlopen(image_request, timeout=30) as response:
+        content_type = response.headers.get_content_type().lower()
+        if not content_type.startswith("image/"):
+            raise ValueError("Pinterest returned a non-image resource")
+        data = response.read(MAX_VIDEO_BYTES + 1)
+
+    if not data or len(data) > MAX_VIDEO_BYTES:
+        raise ValueError("Pinterest image is empty or exceeds the 2 GB limit")
+    extension = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(content_type, ".jpg")
+    safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:100] or "pinterest"
+    filename = Path(folder) / f"{safe_title}{extension}"
+    filename.write_bytes(data)
+    return filename, title
+
+
+def download_media(url: str, folder: str) -> tuple[Path, str, str]:
+    try:
+        path, title = download_video(url, folder)
+        return path, title, "audio" if is_soundcloud_url(url) else "video"
+    except Exception:
+        if not is_pinterest_url(url):
+            raise
+        log.info("yt-dlp could not process Pinterest URL; trying its public image metadata")
+        path, title = download_pinterest_image(url, folder)
+        return path, title, "photo"
 
 
 def is_soundcloud_url(url: str) -> bool:
@@ -208,8 +288,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return await update.effective_message.reply_text("You are not authorized to use this bot.")
     await update.effective_message.reply_text(
-        "Send up to 5 video links in one message from YouTube, TikTok, or any other site supported by yt-dlp.\n\n"
-        "Videos will be sent together as a Telegram album. SoundCloud links are converted to MP3.\n"
+        "Send up to 5 media links in one message from YouTube, TikTok, Pinterest, or any other site supported by yt-dlp.\n\n"
+        "Videos are sent as an album, Pinterest images as photos, and SoundCloud links as MP3.\n"
         "Maximum video size: 2 GB per file."
     )
 
@@ -217,7 +297,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if authorized(update):
         await update.effective_message.reply_text(
-            "Send up to 5 video URLs in one message. I’ll download them and send the videos as one album.\n"
+            "Send up to 5 media URLs in one message. Videos are sent as an album and Pinterest images as photos.\n"
             "Limits: 2 GB per video, 3 requests per 30 seconds, and one active download per user.\n"
             "Use /id to view your Telegram user ID."
         )
@@ -240,7 +320,7 @@ async def on_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await context.bot.send_message(
             chat_id=change.chat.id,
             text=(
-                "Hey! Reply to a message containing video links and mention "
+                "Hey! Reply to a message containing media links and mention "
                 "@elfilosxyzbot, and I’ll send the files here.\n\n"
                 "SoundCloud is supported too — audio is converted to MP3.\n"
                 "/help — for instructions."
@@ -294,6 +374,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     workdir = tempfile.mkdtemp(prefix="tgdl-", dir=DOWNLOAD_DIR)
     videos: list[tuple[Path, str]] = []
+    photos: list[tuple[Path, str]] = []
     audios: list[tuple[Path, str]] = []
     failures: list[str] = []
 
@@ -302,9 +383,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         for index, url in enumerate(urls, start=1):
             try:
-                file_path, title = await asyncio.to_thread(download_video, url, workdir)
-                if is_soundcloud_url(url):
+                file_path, title, media_type = await asyncio.to_thread(download_media, url, workdir)
+                if media_type == "audio":
                     audios.append((file_path, title))
+                elif media_type == "photo":
+                    photos.append((file_path, title))
                 else:
                     videos.append((file_path, title))
                 await status.edit_text(f"Downloaded {index}/{len(urls)}: {title[:100]}")
@@ -318,6 +401,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if videos:
             await status.edit_text(f"Downloaded {len(videos)} video(s). Sending album…")
             await send_video_album(message, videos, context)
+
+        for path, title in photos:
+            with path.open("rb") as photo:
+                await message.reply_photo(
+                    photo=photo,
+                    caption=title[:900],
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
 
         # Telegram audio albums only accept audio files; keep SoundCloud MP3s separate
         # rather than mixing them into a video album.
