@@ -27,6 +27,7 @@ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_VIDEO_BYTES = 2_000_000_000  # 2 GB
+MAX_PHOTO_BYTES = 10_000_000  # Telegram sendPhoto limit
 MAX_LINKS_PER_MESSAGE = 5
 RATE_LIMIT_REQUESTS = 3
 RATE_LIMIT_WINDOW = 30
@@ -114,10 +115,10 @@ def download_pinterest_image(url: str, folder: str) -> tuple[Path, str]:
         content_type = response.headers.get_content_type().lower()
         if not content_type.startswith("image/"):
             raise ValueError("Pinterest returned a non-image resource")
-        data = response.read(MAX_VIDEO_BYTES + 1)
+        data = response.read(MAX_PHOTO_BYTES + 1)
 
-    if not data or len(data) > MAX_VIDEO_BYTES:
-        raise ValueError("Pinterest image is empty or exceeds the 2 GB limit")
+    if not data or len(data) > MAX_PHOTO_BYTES:
+        raise ValueError("Pinterest image is empty or exceeds Telegram's 10 MB photo limit")
     extension = {
         "image/jpeg": ".jpg",
         "image/png": ".png",
